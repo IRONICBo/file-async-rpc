@@ -1,8 +1,8 @@
 use std::{
-    borrow::BorrowMut, cell::{RefCell, UnsafeCell}, f32::consts::E, sync::{atomic::AtomicUsize, Arc}
+    cell::{RefCell, UnsafeCell},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
-use async_trait::async_trait;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net,
@@ -15,70 +15,25 @@ use crate::{
     common::TimeoutOptions,
     error::RpcError,
     message::{
-        decode_resp_header, Encode, FileBlockResponse, ReqHeader, ReqType,
-        RespHeader, RespType, REQ_HEADER_SIZE,
+        decode_resp_header, Encode, ReqHeader, ReqType, RespHeader, RespType, REQ_HEADER_SIZE,
     },
-    workerpool::WorkerPool,
 };
 
-#[derive(Clone)]
-struct RpcSenderWorkerFactory {
-    worker_pool: WorkerPool,
-}
-
-impl RpcSenderWorkerFactory {
-    pub fn new(max_workers: usize, max_jobs: usize) -> Self {
-        Self {
-            worker_pool: WorkerPool::new(max_workers, max_jobs),
-        }
-    }
-}
-
-#[async_trait]
-pub trait RpcClientConnectionHandler {
-    async fn dispatch(&self, req_header: RespHeader, req_buffer: Vec<u8>);
-}
-
-/// The handler for the RPC file block request.
-pub struct FileBlockHandler {
-    response: FileBlockResponse,
-    done_tx: mpsc::Sender<Vec<u8>>,
-}
-
-impl FileBlockHandler {
-    pub fn new(response: FileBlockResponse, done_tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { response, done_tx }
-    }
-}
-
 /// TODO: combine RpcClientConnectionInner and RpcClientConnection
-struct RpcClientConnectionInner<T>
-where
-    T: RpcClientConnectionHandler + Send + Sync + 'static,
-{
+struct RpcClientConnectionInner {
     /// The TCP stream for the connection.
     stream: UnsafeCell<net::TcpStream>,
     /// Options for the timeout of the connection
     timeout_options: TimeoutOptions,
-    /// The handler for the connection
-    dispatch_handler: T,
     /// Atomic keep alive sequence
     keep_alive_seq: AtomicUsize,
 }
 
-impl<T> RpcClientConnectionInner<T>
-where
-    T: RpcClientConnectionHandler + Send + Sync + 'static,
-{
-    pub fn new(
-        stream: net::TcpStream,
-        timeout_options: TimeoutOptions,
-        dispatch_handler: T,
-    ) -> Self {
+impl RpcClientConnectionInner {
+    pub fn new(stream: net::TcpStream, timeout_options: TimeoutOptions) -> Self {
         Self {
             stream: UnsafeCell::new(stream),
             timeout_options,
-            dispatch_handler,
             keep_alive_seq: AtomicUsize::new(0),
         }
     }
@@ -187,6 +142,7 @@ where
     /// Receive loop for the client.
     pub async fn recv_loop(&self, response_channel_tx: mpsc::Sender<Vec<u8>>) {
         loop {
+            debug!("Waiting for response...");
             let resp_header = self.recv_header().await;
             match resp_header {
                 Ok(header) => {
@@ -210,6 +166,7 @@ where
                             continue;
                         }
                         _ => {
+                            debug!("Received response header: {:?}", header);
                             let resp_buffer = match self.recv_len(header.len).await {
                                 Ok(buffer) => buffer,
                                 Err(err) => {
@@ -260,37 +217,21 @@ where
     }
 }
 
-unsafe impl<T> Send for RpcClientConnectionInner<T> where
-    T: RpcClientConnectionHandler + Send + Sync + 'static
-{
-}
+unsafe impl Send for RpcClientConnectionInner {}
 
-unsafe impl<T> Sync for RpcClientConnectionInner<T> where
-    T: RpcClientConnectionHandler + Send + Sync + 'static
-{
-}
+unsafe impl Sync for RpcClientConnectionInner {}
 
 /// The RPC client definition.
-pub struct RpcClient<T>
-where
-    T: RpcClientConnectionHandler + Send + Sync + 'static,
-{
-    /// Options for the timeout of the server connection
-    timeout_options: TimeoutOptions,
+pub struct RpcClient {
     /// Request channel for buffer
     request_channel_tx: mpsc::Sender<Vec<u8>>,
     /// Response channel for buffer
     response_channel_rx: RefCell<mpsc::Receiver<Vec<u8>>>,
-    /// Dispatch handler
-    dispatch_handler: T,
 }
 
-impl<T> RpcClient<T>
-where
-    T: RpcClientConnectionHandler + Send + Sync + 'static,
-{
+impl RpcClient {
     /// Create a new RPC client.
-    pub async fn new(addr: &str, timeout_options: TimeoutOptions, dispatch_handler: T) -> Self {
+    pub async fn new(addr: &str, timeout_options: TimeoutOptions) -> Self {
         let stream = net::TcpStream::connect(addr)
             .await
             .expect("Failed to connect to the server");
@@ -300,7 +241,6 @@ where
         let inner_connection = Arc::new(RpcClientConnectionInner::new(
             stream,
             timeout_options.clone(),
-            dispatch_handler,
         ));
 
         // Create a keepalive send loop
@@ -318,7 +258,6 @@ where
         });
 
         Self {
-            timeout_options: timeout_options.clone(),
             request_channel_tx,
             response_channel_rx: RefCell::new(response_channel_rx),
         }
@@ -340,6 +279,66 @@ where
             .borrow_mut()
             .recv()
             .await
-            .ok_or(RpcError::InternalError("Failed to receive response".to_string()))
+            .ok_or(RpcError::InternalError(
+                "Failed to receive response".to_string(),
+            ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::TimeoutOptions;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_rpc_client() {
+        // Set the tracing log level to debug
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::FmtSubscriber::builder()
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        )
+        .expect("Failed to set tracing subscriber");
+
+        let addr = "127.0.0.1:2789";
+        let timeout_options = TimeoutOptions {
+            read_timeout: Duration::from_secs(20),
+            write_timeout: Duration::from_secs(20),
+            idle_timeout: Duration::from_secs(20),
+        };
+
+        // Create a fake server, will directly return the request
+        tokio::spawn(async move {
+            let listener = net::TcpListener::bind(addr).await.unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (mut reader, mut writer) = stream.into_split();
+                let mut buffer = vec![0u8; 1024];
+                let size = reader.read(&mut buffer).await.unwrap();
+                debug!("Received request: {:?}", &buffer[..size]);
+                // Create a response header
+                let resp_header = RespHeader {
+                    seq: 0,
+                    resp_type: RespType::KeepAliveResponse,
+                    len: 0,
+                };
+                let resp_header = resp_header.encode();
+                writer.write_all(&resp_header).await.unwrap();
+                debug!("Sent response: {:?}", resp_header);
+            }
+        });
+
+        // Wait for the server to start
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let rpc_client = RpcClient::new(addr, timeout_options).await;
+
+        // Wait for the server to start
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Current implementation will send keep alive message every 20/3 seconds
+        let resp = rpc_client.recv_response().await;
+        assert!(resp.is_err());
     }
 }

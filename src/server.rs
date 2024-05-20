@@ -1,13 +1,11 @@
 use std::{
     cell::UnsafeCell,
-    sync::{mpsc, Arc},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net, task,
-    time::timeout,
+    io::{AsyncReadExt, AsyncWriteExt}, net, sync::mpsc, task, time::timeout
 };
 
 use crate::{
@@ -41,13 +39,6 @@ impl Job for FileBlockHandler {
         // Mock: serve block request and send response
         let size = self.request.block_size;
 
-        // Prepare response header
-        let resp_header = RespHeader {
-            seq: self.request.seq,
-            resp_type: RespType::FileBlockResponse,
-            len: size,
-        };
-        let mut resp_buffer = resp_header.encode();
         // Prepare response body
         // Mock: response body is all zeros
         let file_block_resp = FileBlockResponse {
@@ -59,11 +50,18 @@ impl Job for FileBlockHandler {
             data: vec![0u8; size as usize],
         };
         let resp_body = file_block_resp.encode();
+        // Prepare response header
+        let resp_header = RespHeader {
+            seq: self.request.seq,
+            resp_type: RespType::FileBlockResponse,
+            len: resp_body.len() as u64,
+        };
+        let mut resp_buffer = resp_header.encode();
         // Combine response header and body
         resp_buffer.extend_from_slice(&resp_body);
 
         // Send response to the done channel
-        self.done_tx.send(resp_buffer).unwrap();
+        self.done_tx.send(resp_buffer).await.unwrap();
     }
 }
 
@@ -343,7 +341,7 @@ where
         debug!("RpcServerConnection::run");
 
         // TODO: copy done_tx to the worker pool
-        let (done_tx, done_rx) = mpsc::channel::<Vec<u8>>();
+        let (done_tx, mut done_rx) = mpsc::channel::<Vec<u8>>(1000);
 
         // Send response to the stream from the worker pool
         // Worker pool will handle the response sending
@@ -352,8 +350,8 @@ where
             // TODO: Recv response from the worker pool and send to the stream
             debug!("RpcServerConnection::run worker pool");
             loop {
-                match done_rx.recv() {
-                    Ok(resp_buffer) => {
+                match done_rx.recv().await {
+                    Some(resp_buffer) => {
                         // Send response to the stream
                         if let Ok(res) = inner_conn.send_response(&resp_buffer).await {
                             info!("Sent file block response: {:?}", res);
@@ -361,8 +359,8 @@ where
                             info!("Failed to send file block response");
                         }
                     }
-                    Err(err) => {
-                        debug!("Failed to receive response from worker pool: {:?}", err);
+                    None => {
+                        info!("done_rx channel is closed");
                         break;
                     }
                 }
@@ -372,7 +370,10 @@ where
         loop {
             // Receive the request header
             let req_header = match self.inner.recv_header().await {
-                Ok(header) => header,
+                Ok(header) => {
+                    debug!("Received request header: {:?}", header);
+                    header
+                }
                 Err(err) => {
                     debug!("Failed to receive request header: {:?}", err);
                     return;
