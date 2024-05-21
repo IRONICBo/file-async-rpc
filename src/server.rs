@@ -9,16 +9,13 @@ use tokio::{
 };
 
 use crate::{
-    common::TimeoutOptions,
-    error::RpcError,
-    message::{
-        decode_file_block_request, decode_req_header, encode_resp_header, Encode, FileBlockRequest,
-        FileBlockResponse, ReqHeader, ReqType, RespHeader, RespType, StatusCode, REQ_HEADER_SIZE,
-    },
-    workerpool::{Job, WorkerPool},
+    common::TimeoutOptions, error::RpcError, message::{
+        decode_file_block_request, FileBlockRequest,
+        FileBlockResponse, ReqType, RespType, StatusCode,
+    }, packet::{Decode, Encode, ReqHeader, RespHeader, REQ_HEADER_SIZE}, workerpool::{Job, WorkerPool}
 };
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// The handler for the RPC file block request.
 pub struct FileBlockHandler {
@@ -53,7 +50,7 @@ impl Job for FileBlockHandler {
         // Prepare response header
         let resp_header = RespHeader {
             seq: self.request.seq,
-            resp_type: RespType::FileBlockResponse,
+            op: RespType::FileBlockResponse.to_u8(),
             len: resp_body.len() as u64,
         };
         let mut resp_buffer = resp_header.encode();
@@ -113,33 +110,35 @@ impl RpcServerConnectionHandler for FileBlockRpcServerHandler {
         done_tx: mpsc::Sender<Vec<u8>>,
     ) {
         // Dispatch the handler for the connection
-        match req_header.req_type {
-            ReqType::FileBlockRequest => {
-                // Try to read the request body
-                // Decode the request body
-                let req_body = decode_file_block_request(&req_buffer)
-                    .expect("Failed to decode file block request");
+        if let Ok(req_type) = ReqType::from_u8(req_header.op) {
+            match req_type {
+                ReqType::FileBlockRequest => {
+                    // Try to read the request body
+                    // Decode the request body
+                    let req_body = decode_file_block_request(&req_buffer)
+                        .expect("Failed to decode file block request");
 
-                // File block request
-                // Submit the handler to the worker pool
-                // When the handler is done, send the response to the done channel
-                // Response need to contain the response header and body
-                let handler = FileBlockHandler::new(req_body, done_tx.clone());
-                if let Ok(_) = self
-                    .worker_pool
-                    .submit_job(Box::new(handler))
-                    .map_err(|err| {
-                        debug!("Failed to submit job: {:?}", err);
-                    })
-                {
-                    debug!("Submitted job to worker pool");
+                    // File block request
+                    // Submit the handler to the worker pool
+                    // When the handler is done, send the response to the done channel
+                    // Response need to contain the response header and body
+                    let handler = FileBlockHandler::new(req_body, done_tx.clone());
+                    if let Ok(_) = self
+                        .worker_pool
+                        .submit_job(Box::new(handler))
+                        .map_err(|err| {
+                            debug!("Failed to submit job: {:?}", err);
+                        })
+                    {
+                        debug!("Submitted job to worker pool");
+                    }
                 }
-            }
-            _ => {
-                debug!(
-                    "FileBlockRpcServerHandler: Inner request type is not matched: {:?}",
-                    req_header.req_type
-                );
+                _ => {
+                    debug!(
+                        "FileBlockRpcServerHandler: Inner request type is not matched: {:?}",
+                        req_header.op
+                    );
+                }
             }
         }
     }
@@ -199,7 +198,7 @@ where
     /// Recv request header from the stream
     pub async fn recv_header(&self) -> Result<ReqHeader, RpcError<String>> {
         let req_header_buffer = self.recv_len(REQ_HEADER_SIZE).await?;
-        let req_header = decode_req_header(&req_header_buffer)?;
+        let req_header = ReqHeader::decode(&req_header_buffer)?;
         debug!("Received request header: {:?}", req_header);
 
         Ok(req_header)
@@ -298,40 +297,44 @@ where
         // Dispatch the handler for the connection
         let seq = req_header.seq;
         let body_len = req_header.len;
-        match req_header.req_type {
-            ReqType::KeepAliveRequest => {
-                // Keep-alive request
-                // Directly send keepalive response to client, do not need to submit to worker pool.
-                let _ = KeepAliveHandler::new();
+        if let Ok(req_type) = ReqType::from_u8(req_header.op) {
+            match req_type {
+                ReqType::KeepAliveRequest => {
+                    // Keep-alive request
+                    // Directly send keepalive response to client, do not need to submit to worker pool.
+                    let _ = KeepAliveHandler::new();
 
-                // In current implementation, we just send keepalive header to the client stream
-                let resp_header = RespHeader {
-                    seq,
-                    resp_type: RespType::KeepAliveResponse,
-                    len: 0,
-                };
-                let resp_buffer = encode_resp_header(&resp_header);
-                if let Ok(res) = self.inner.send_response(&resp_buffer).await {
-                    info!("Sent keepalive response: {:?}", res);
-                } else {
-                    info!("Failed to send keepalive response");
+                    // In current implementation, we just send keepalive header to the client stream
+                    let resp_header = RespHeader {
+                        seq,
+                        op: RespType::KeepAliveResponse.to_u8(),
+                        len: 0,
+                    };
+                    let resp_buffer = RespHeader::encode(&resp_header);
+                    if let Ok(res) = self.inner.send_response(&resp_buffer).await {
+                        debug!("Sent keepalive response: {:?}", res);
+                    } else {
+                        error!("Failed to send keepalive response");
+                    }
+                }
+                _ => {
+                    // Try to read the request body
+                    let req_buffer = match self.inner.recv_len(body_len).await {
+                        Ok(buffer) => buffer,
+                        Err(err) => {
+                            error!("Failed to receive request body: {:?}", err);
+                            return;
+                        }
+                    };
+                    debug!("Inner request type: {:?}", req_header.op);
+                    self.inner
+                        .dispatch_handler
+                        .dispatch(req_header, req_buffer, done_tx)
+                        .await;
                 }
             }
-            _ => {
-                // Try to read the request body
-                let req_buffer = match self.inner.recv_len(body_len).await {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        debug!("Failed to receive request body: {:?}", err);
-                        return;
-                    }
-                };
-                debug!("Inner request type: {:?}", req_header.req_type);
-                self.inner
-                    .dispatch_handler
-                    .dispatch(req_header, req_buffer, done_tx)
-                    .await;
-            }
+        } else {
+            debug!("Inner request type is not matched: {:?}", req_header.op);
         }
     }
 

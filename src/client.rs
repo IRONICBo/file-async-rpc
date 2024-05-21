@@ -1,6 +1,6 @@
 use std::{
     cell::{RefCell, UnsafeCell},
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{atomic::{AtomicU64, AtomicUsize}, Arc}, u8,
 };
 
 use tokio::{
@@ -12,36 +12,41 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-    common::TimeoutOptions,
-    error::RpcError,
-    message::{
-        decode_resp_header, Encode, ReqHeader, ReqType, RespHeader, RespType, REQ_HEADER_SIZE,
-    },
+    common::TimeoutOptions, error::RpcError, message::{ReqType, RespType}, packet::{
+        Decode, Encode, Packet, PacketTask, ReqHeader, RespHeader, REQ_HEADER_SIZE
+    }
 };
 
 /// TODO: combine RpcClientConnectionInner and RpcClientConnection
-struct RpcClientConnectionInner {
+struct RpcClientConnectionInner<T>
+    where T: Packet + Clone + Send + Sync + 'static
+{
     /// The TCP stream for the connection.
     stream: UnsafeCell<net::TcpStream>,
     /// Options for the timeout of the connection
     timeout_options: TimeoutOptions,
-    /// Atomic keep alive sequence
-    keep_alive_seq: AtomicUsize,
+    /// Stream auto increment sequence number, used to mark the request and response
+    seq: AtomicU64,
+    /// send packet task
+    packet_task: UnsafeCell<PacketTask<T>>
 }
 
-impl RpcClientConnectionInner {
+impl<P> RpcClientConnectionInner<P>
+where P: Packet + Clone + Send + Sync + 'static
+{
     pub fn new(stream: net::TcpStream, timeout_options: TimeoutOptions) -> Self {
         Self {
             stream: UnsafeCell::new(stream),
-            timeout_options,
-            keep_alive_seq: AtomicUsize::new(0),
+            timeout_options: timeout_options.clone(),
+            seq: AtomicU64::new(0),
+            packet_task: UnsafeCell::new(PacketTask::new(timeout_options.clone().idle_timeout.as_secs())),
         }
     }
 
     /// Recv request header from the stream
     pub async fn recv_header(&self) -> Result<RespHeader, RpcError<String>> {
         let req_header_buffer = self.recv_len(REQ_HEADER_SIZE).await?;
-        let req_header = decode_resp_header(&req_header_buffer)?;
+        let req_header = RespHeader::decode(&req_header_buffer)?;
         debug!("Received request header: {:?}", req_header);
 
         Ok(req_header)
@@ -97,8 +102,13 @@ impl RpcClientConnectionInner {
         }
     }
 
+    /// Get the next sequence number.
+    pub fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Send loop for the client.
-    pub async fn send_loop(&self, request_channel_rx: &mut mpsc::Receiver<Vec<u8>>) {
+    pub async fn send_loop(&self, request_channel_rx: &mut mpsc::Receiver<P>) {
         // Tickers to keep alive the connection
         let mut tickers = tokio::time::interval(self.timeout_options.idle_timeout / 3);
         loop {
@@ -106,13 +116,14 @@ impl RpcClientConnectionInner {
                 _ = tickers.tick() => {
                     // Send keep alive message
                     let keep_alive_msg = ReqHeader {
-                        seq: self.keep_alive_seq.load(std::sync::atomic::Ordering::Relaxed) as u64,
-                        req_type: ReqType::KeepAliveRequest,
+                        seq: self.next_seq(),
+                        op: ReqType::KeepAliveRequest.to_u8(),
                         len: 0,
                     }.encode();
 
                     if let Ok(_) =  self.send_data(&keep_alive_msg).await {
                         debug!("Sent keep alive message");
+                        // Set to packet task
                     } else {
                         debug!("Failed to send keep alive message");
                         break;
@@ -121,10 +132,26 @@ impl RpcClientConnectionInner {
                 req_result = request_channel_rx.recv() => {
                     match req_result {
                         Some(req) => {
-                            if let Ok(_) = self.send_data(&req).await {
-                                debug!("Sent request: {:?}", req);
+                            if let Ok(req_buffer) = req.serialize() {
+                                let req_header = ReqHeader {
+                                    seq: req.seq(),
+                                    op: req.op(),
+                                    len: req_buffer.len() as u64,
+                                }.encode();
+
+                                if let Ok(_) = self.send_data(&req_header).await {
+                                    debug!("Sent request header: {:?}", req_header);
+                                    // Set to packet task
+                                    self.get_packet_task_mut().add_task(req.clone()).await;
+                                } else {
+                                    debug!("Failed to send request header: {:?}", req.seq());
+                                    break;
+                                }
+
+                                debug!("Sent request: {:?}", req_buffer);
+
                             } else {
-                                debug!("Failed to send request: {:?}", req);
+                                debug!("Failed to serialize request: {:?}", req.seq());
                                 break;
                             }
                         }
@@ -140,59 +167,60 @@ impl RpcClientConnectionInner {
     }
 
     /// Receive loop for the client.
-    pub async fn recv_loop(&self, response_channel_tx: mpsc::Sender<Vec<u8>>) {
+    pub async fn recv_loop(&self, response_channel_tx: mpsc::Sender<P>) {
         loop {
             debug!("Waiting for response...");
             let resp_header = self.recv_header().await;
             match resp_header {
                 Ok(header) => {
-                    match header.resp_type {
-                        RespType::KeepAliveResponse => {
-                            debug!("Received keep alive response.");
-                            let current_keep_alive_seq = self
-                                .keep_alive_seq
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if header.seq != current_keep_alive_seq as u64 {
-                                debug!(
-                                    "Keep alive sequence mismatch: {} != {}",
-                                    header.seq, current_keep_alive_seq
-                                );
+                    let header_seq = header.seq;
+                    if let Ok(resp_type) = RespType::from_u8(header.op) {
+                        match resp_type {
+                            RespType::KeepAliveResponse => {
+                                debug!("Received keep alive response.");
+
+                                // Try to get and check the packet
+                                let packet_task = self.get_packet_task_mut();
+                                let _ = packet_task.get_task(header_seq);
+
+                                continue;
                             }
+                            _ => {
+                                debug!("Received response header: {:?}", header);
+                                let resp_buffer = match self.recv_len(header.len).await {
+                                    Ok(buffer) => buffer,
+                                    Err(err) => {
+                                        debug!("Failed to receive request body: {:?}", err);
+                                        break;
+                                    }
+                                };
 
-                            // Received keep alive response, increment the keep alive sequence
-                            self.keep_alive_seq
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // Send data to the response channel
+                                // We need to check channel data's type and send it to the corresponding channel
+                                // 1. Use a fixed number in resp_buffer and check the type?
+                                // 2. Or merge the header and buffer and send it to the channel?
+                                // header buffer with body buffer
 
-                            continue;
-                        }
-                        _ => {
-                            debug!("Received response header: {:?}", header);
-                            let resp_buffer = match self.recv_len(header.len).await {
-                                Ok(buffer) => buffer,
-                                Err(err) => {
-                                    debug!("Failed to receive request body: {:?}", err);
+                                // Take the packet task and recv the response
+                                let packet_task: &mut PacketTask<P> = self.get_packet_task_mut();
+                                if let Some(body) = packet_task.get_task(header_seq).await {
+                                    // Try to fill the packet with the response
+                                    body.deserialize(resp_buffer.as_slice()).unwrap();
+                                    if let Ok(_) = response_channel_tx.send(body.clone()).await {
+                                        debug!("Sent response body");
+                                    } else {
+                                        debug!("Failed to send response body");
+                                        break;
+                                    }
+                                } else {
+                                    debug!("Failed to get packet task");
                                     break;
                                 }
-                            };
-
-                            // Send data to the response channel
-                            // We need to check channel data's type and send it to the corresponding channel
-                            // 1. Use a fixed number in resp_buffer and check the type?
-                            // 2. Or merge the header and buffer and send it to the channel?
-                            // header buffer with body buffer
-                            if let Ok(_) = response_channel_tx.send(header.encode()).await {
-                                debug!("Sent response header: {:?}", header);
-                            } else {
-                                debug!("Failed to send response header: {:?}", header);
-                                break;
-                            }
-                            if let Ok(_) = response_channel_tx.send(resp_buffer).await {
-                                debug!("Sent response body");
-                            } else {
-                                debug!("Failed to send response body");
-                                break;
                             }
                         }
+                    } else {
+                        debug!("Invalid response type: {:?}", header.op);
+                        break;
                     }
                 }
                 Err(err) => {
@@ -215,29 +243,50 @@ impl RpcClientConnectionInner {
     fn get_stream(&self) -> &net::TcpStream {
         unsafe { std::mem::transmute(self.stream.get()) }
     }
+
+    /// Get packet task with mutable reference
+    #[inline(always)]
+    fn get_packet_task_mut(&self) -> &mut PacketTask<P> {
+        // Current implementation is safe because the packet task is only accessed by one thread
+        unsafe { std::mem::transmute(self.packet_task.get()) }
+    }
+
+    /// Get packet task with immutable reference
+    #[inline(always)]
+    fn get_packet_task(&self) -> &PacketTask<P> {
+        unsafe { std::mem::transmute(self.packet_task.get()) }
+    }
 }
 
-unsafe impl Send for RpcClientConnectionInner {}
+unsafe impl<P> Send for RpcClientConnectionInner<P>
+    where P: Packet + Clone + Send + Sync + 'static
+{}
 
-unsafe impl Sync for RpcClientConnectionInner {}
+unsafe impl<P> Sync for RpcClientConnectionInner<P>
+    where P: Packet + Clone + Send + Sync + 'static
+{}
 
 /// The RPC client definition.
-pub struct RpcClient {
+pub struct RpcClient<P>
+where P: Packet + Clone + Send + Sync + 'static,
+{
     /// Request channel for buffer
-    request_channel_tx: mpsc::Sender<Vec<u8>>,
+    request_channel_tx: mpsc::Sender<P>,
     /// Response channel for buffer
-    response_channel_rx: RefCell<mpsc::Receiver<Vec<u8>>>,
+    response_channel_rx: RefCell<mpsc::Receiver<P>>,
 }
 
-impl RpcClient {
+impl<P> RpcClient<P>
+    where P: Packet + Clone + Send + Sync + 'static
+{
     /// Create a new RPC client.
     pub async fn new(addr: &str, timeout_options: TimeoutOptions) -> Self {
         let stream = net::TcpStream::connect(addr)
             .await
             .expect("Failed to connect to the server");
         // TODO: use bounded channel
-        let (request_channel_tx, mut request_channel_rx) = mpsc::channel::<Vec<u8>>(1000);
-        let (response_channel_tx, response_channel_rx) = mpsc::channel::<Vec<u8>>(1000);
+        let (request_channel_tx, mut request_channel_rx) = mpsc::channel::<P>(1000);
+        let (response_channel_tx, response_channel_rx) = mpsc::channel::<P>(1000);
         let inner_connection = Arc::new(RpcClientConnectionInner::new(
             stream,
             timeout_options.clone(),
@@ -266,7 +315,7 @@ impl RpcClient {
     /// Send a request to the server.
     /// Try to send data to channel, if the channel is full, return an error.
     /// Contains the request header and body.
-    pub async fn send_request(&self, req: Vec<u8>) -> Result<(), RpcError<String>> {
+    pub async fn send_request(&self, req: P) -> Result<(), RpcError<String>> {
         self.request_channel_tx
             .send(req)
             .await
@@ -274,7 +323,7 @@ impl RpcClient {
     }
 
     /// Receive a response from the server.
-    pub async fn recv_response(&self) -> Result<Vec<u8>, RpcError<String>> {
+    pub async fn recv_response(&self) -> Result<P, RpcError<String>> {
         self.response_channel_rx
             .borrow_mut()
             .recv()
@@ -290,6 +339,47 @@ mod tests {
     use super::*;
     use crate::common::TimeoutOptions;
     use std::time::Duration;
+
+    #[derive(Debug, Clone)]
+    pub struct TestPacket {
+        pub seq: u64,
+        pub op: u8,
+        pub status: u8,
+    }
+
+    impl Packet for TestPacket {
+        fn seq(&self) -> u64 {
+            self.seq
+        }
+
+        fn set_seq(&mut self, seq: u64) {
+            self.seq = seq;
+        }
+
+        fn op(&self) -> u8 {
+            self.op
+        }
+
+        fn set_op(&mut self, op: u8) {
+            self.op = op;
+        }
+
+        fn serialize(&self) -> Result<Vec<u8>, RpcError<String>> {
+            Ok(vec![0u8; 0])
+        }
+
+        fn deserialize(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
+            Ok(())
+        }
+
+        fn status(&self) -> u8 {
+            self.status
+        }
+
+        fn set_status(&mut self, status: u8) {
+            self.status = status;
+        }
+    }
 
     #[tokio::test]
     async fn test_rpc_client() {
@@ -320,7 +410,7 @@ mod tests {
                 // Create a response header
                 let resp_header = RespHeader {
                     seq: 0,
-                    resp_type: RespType::KeepAliveResponse,
+                    op: RespType::KeepAliveResponse.to_u8(),
                     len: 0,
                 };
                 let resp_header = resp_header.encode();
@@ -332,7 +422,7 @@ mod tests {
         // Wait for the server to start
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let rpc_client = RpcClient::new(addr, timeout_options).await;
+        let rpc_client = RpcClient::<TestPacket>::new(addr, timeout_options).await;
 
         // Wait for the server to start
         tokio::time::sleep(Duration::from_secs(2)).await;
