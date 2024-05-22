@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use file_async_rpc::{client::RpcClient, common::TimeoutOptions, error::RpcError, message::ReqType, packet::{Packet, ReqHeader}, server::{FileBlockRpcServerHandler, RpcServer, RpcServerConnectionHandler}, workerpool::{Job, WorkerPool}};
 use tokio::{net::TcpStream, sync::mpsc, time::Instant};
 use tonic::async_trait;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Check if the port is in use
 async fn is_port_in_use(addr: &str) -> bool {
@@ -139,8 +139,9 @@ impl RpcServerConnectionHandler for TestRpcServerHandler {
         }
     }
 }
-#[tokio::test]
-async fn test_rpc_send_recv() {
+
+#[tokio::main]
+async fn main() {
     // Set the tracing log level to debug
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
@@ -177,20 +178,22 @@ async fn test_rpc_send_recv() {
     // Create client
     let rpc_client = RpcClient::<TestPacket>::new(addr, rpc_client_options).await;
 
-    for _ in 0..num_files {
+    for idx in 0..num_files {
+        debug!("Sending request: {}", idx);
         let res = rpc_client.send_request(TestPacket::new(1)).await;
         // assert!(res.is_ok());
     }
 
 
     // check response
-    for _ in 0..num_files {
+    for idx in 0..num_files {
+        debug!("Receiving response: {}", idx);
         let res = rpc_client.recv_response().await;
         // assert!(res.is_ok());
     }
 
-    let duration = start.elapsed();
-    println!("Time taken to send and receive responses for {} files: {:?}", num_files, duration);
+    let duration = start.elapsed().as_micros();
+    info!("Time taken to send and receive responses for {} files: cost {} ms", num_files, duration);
 
     // let resp = rpc_client.recv_response().await;
 

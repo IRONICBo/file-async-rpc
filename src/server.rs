@@ -216,8 +216,8 @@ where
         .await
         {
             Ok(result) => match result {
-                Ok(_) => {
-                    debug!("Received request body: {:?}", req_buffer);
+                Ok(result_size) => {
+                    debug!("Received request body: {:?}", result_size);
                     return Ok(req_buffer);
                 }
                 Err(err) => {
