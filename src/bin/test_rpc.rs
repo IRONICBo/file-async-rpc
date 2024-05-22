@@ -3,7 +3,11 @@ use std::{sync::Arc, time::Duration};
 use file_async_rpc::{client::RpcClient, common::TimeoutOptions, error::RpcError, message::ReqType, packet::{Packet, ReqHeader}, server::{FileBlockRpcServerHandler, RpcServer, RpcServerConnectionHandler}, workerpool::{Job, WorkerPool}};
 use tokio::{net::TcpStream, sync::mpsc, time::Instant};
 use tonic::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
+
+// 4MB
+const MAX_PACKET_SIZE: usize = 4 * 1024 * 1024;
+const MAX_PACKET_NUM: usize = 1000;
 
 /// Check if the port is in use
 async fn is_port_in_use(addr: &str) -> bool {
@@ -52,7 +56,7 @@ impl Packet for TestPacket {
         // Try to serialize the request packet to a byte array
 
         // Return a 4MB vec
-        Ok(vec![0u8; 4 * 1024 * 1024])
+        Ok(vec![0u8; MAX_PACKET_SIZE])
     }
 
     fn deserialize(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
@@ -84,7 +88,7 @@ impl TestHandler {
 #[async_trait]
 impl Job for TestHandler {
     async fn run(&self) {
-        self.done_tx.send(vec![0u8; 8]).await.unwrap();
+        self.done_tx.send(vec![0u8; 4]).await.unwrap();
     }
 }
 
@@ -118,16 +122,17 @@ impl RpcServerConnectionHandler for TestRpcServerHandler {
                     // Submit the handler to the worker pool
                     // When the handler is done, send the response to the done channel
                     // Response need to contain the response header and body
-                    let handler = TestHandler::new(done_tx.clone());
-                    if let Ok(_) = self
-                        .worker_pool
-                        .submit_job(Box::new(handler))
-                        .map_err(|err| {
-                            debug!("Failed to submit job: {:?}", err);
-                        })
-                    {
-                        debug!("Submitted job to worker pool");
-                    }
+                    // let handler = TestHandler::new(done_tx.clone());
+                    // if let Ok(_) = self
+                    //     .worker_pool
+                    //     .submit_job(Box::new(handler))
+                    //     .map_err(|err| {
+                    //         debug!("Failed to submit job: {:?}", err);
+                    //     })
+                    // {
+                    //     debug!("Submitted job to worker pool");
+                    // }
+                    done_tx.send(vec![0u8; 8]).await.unwrap();
                 }
                 _ => {
                     debug!(
@@ -174,26 +179,37 @@ async fn main() {
     // assert!(is_port_in_use(addr).await);
 
     let start = Instant::now();
-    let num_files = 1000;
     // Create client
     let rpc_client = RpcClient::<TestPacket>::new(addr, rpc_client_options).await;
 
-    for idx in 0..num_files {
+    for idx in 0..MAX_PACKET_NUM {
         debug!("Sending request: {}", idx);
         let res = rpc_client.send_request(TestPacket::new(1)).await;
         // assert!(res.is_ok());
     }
-
+    let duration = start.elapsed();
+    info!("Time taken to send requests for {} files: cost {} s", MAX_PACKET_NUM, duration.as_secs_f64());
 
     // check response
-    for idx in 0..num_files {
-        debug!("Receiving response: {}", idx);
-        let res = rpc_client.recv_response().await;
-        // assert!(res.is_ok());
+    // for idx in 0..MAX_PACKET_NUM {
+    //     debug!("Receiving response: {}", idx);
+    //     let res = rpc_client.recv_response().await;
+    //     // assert!(res.is_ok());
+    // }
+    loop {
+        match rpc_client.recv_response().await {
+            Ok(data) => {
+                debug!("Receiving response: {:?}", data);
+            }
+            Err(err) => {
+                error!("Can not receive new response: {:?}", err);
+                break;
+            }
+        }
     }
 
-    let duration = start.elapsed().as_micros();
-    info!("Time taken to send and receive responses for {} files: cost {} ms", num_files, duration);
+    let duration = start.elapsed();
+    info!("Time taken to send and receive responses for {} files, cost {} s, buffer size is {}MB, speed is {} MB/s", MAX_PACKET_NUM, duration.as_secs_f64(), MAX_PACKET_SIZE / 1024 / 1024, ((MAX_PACKET_SIZE * MAX_PACKET_NUM / 1024 / 1024) as f64) / duration.as_secs_f64());
 
     // let resp = rpc_client.recv_response().await;
 

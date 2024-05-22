@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::{collections::{HashMap, VecDeque}, fmt::Debug};
 
 use tracing::debug;
 
@@ -107,7 +107,7 @@ impl Decode for RespHeader {
 ///
 /// Client will receive the response packet and deserialize it to a packet struct.
 /// and check the status of the packet and the response.
-pub trait Packet: Sync + Send + Clone {
+pub trait Packet: Sync + Send + Clone + Debug {
     /// Get the packet seq number
     fn seq(&self) -> u64;
     /// Set the packet seq number
@@ -197,6 +197,7 @@ impl<P: Packet + Send + Sync> PacketTask<P> {
     pub async fn get_task(&mut self, seq: u64) -> Option<&mut P> {
         if let Some(packet) = self.packets.get_mut(&seq) {
             match PacketStatus::from_u8(packet.status()) {
+                // TODO: Only used for check status, we will not modify the status here
                 PacketStatus::Success => {
                     return Some(packet);
                 }
@@ -216,6 +217,8 @@ impl<P: Packet + Send + Sync> PacketTask<P> {
                             packet.set_status(PacketStatus::Timeout.to_u8());
                             return None;
                         }
+
+                        return Some(packet);
                     } else {
                         return None;
                     }

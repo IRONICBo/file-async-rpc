@@ -12,7 +12,7 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-    common::TimeoutOptions, error::RpcError, message::{ReqType, RespType}, packet::{
+    common::TimeoutOptions, error::RpcError, message::{KeepAlivePacket, ReqType, RespType}, packet::{
         Decode, Encode, Packet, PacketTask, ReqHeader, RespHeader, REQ_HEADER_SIZE
     }
 };
@@ -27,6 +27,10 @@ struct RpcClientConnectionInner<T>
     timeout_options: TimeoutOptions,
     /// Stream auto increment sequence number, used to mark the request and response
     seq: AtomicU64,
+    /// Received keep alive seq number, will mark the valid keep alive response.
+    /// If the keep alive response is not received in 100 times, the connection will be closed,
+    /// If we receive other response, we will update the received_keepalive_seq too, just treat it as a keep alive response.
+    received_keepalive_seq: AtomicU64,
     /// send packet task
     packet_task: UnsafeCell<PacketTask<T>>
 }
@@ -39,6 +43,7 @@ where P: Packet + Clone + Send + Sync + 'static
             stream: UnsafeCell::new(stream),
             timeout_options: timeout_options.clone(),
             seq: AtomicU64::new(0),
+            received_keepalive_seq: AtomicU64::new(0),
             packet_task: UnsafeCell::new(PacketTask::new(timeout_options.clone().idle_timeout.as_secs())),
         }
     }
@@ -87,7 +92,7 @@ where P: Packet + Clone + Send + Sync + 'static
         match timeout(self.timeout_options.write_timeout, writer.write_all(data)).await {
             Ok(result) => match result {
                 Ok(_) => {
-                    debug!("Sent data: {:?}", data);
+                    debug!("Sent data with length: {:?}", data.len());
                     return Ok(());
                 }
                 Err(err) => {
@@ -115,41 +120,52 @@ where P: Packet + Clone + Send + Sync + 'static
             tokio::select! {
                 _ = tickers.tick() => {
                     // Send keep alive message
+                    let current_seq = self.next_seq();
+                    // Check keepalive is valid
+                    let received_keepalive_seq = self.received_keepalive_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    if current_seq - received_keepalive_seq > 100 {
+                        debug!("Keep alive timeout, close the connection");
+                        break;
+                    }
+
+                    // Set to packet task
                     let keep_alive_msg = ReqHeader {
-                        seq: self.next_seq(),
+                        seq: current_seq,
                         op: ReqType::KeepAliveRequest.to_u8(),
                         len: 0,
                     }.encode();
 
                     if let Ok(_) =  self.send_data(&keep_alive_msg).await {
-                        debug!("Sent keep alive message");
-                        // Set to packet task
+                        debug!("Success to sent keep alive message");
                     } else {
                         debug!("Failed to send keep alive message");
-                        break;
                     }
                 }
                 req_result = request_channel_rx.recv() => {
                     match req_result {
-                        Some(req) => {
+                        Some(mut req) => {
+                            let current_seq = self.next_seq();
+                            req.set_seq(current_seq);
+                            debug!("Try to send request: {:?}", req);
+
                             if let Ok(req_buffer) = req.serialize() {
-                                let req_header = ReqHeader {
+                                let mut req_header = ReqHeader {
                                     seq: req.seq(),
                                     op: req.op(),
                                     len: req_buffer.len() as u64,
                                 }.encode();
 
+                                // concate req_header and req_buffer
+                                req_header.extend_from_slice(&req_buffer);
+
                                 if let Ok(_) = self.send_data(&req_header).await {
-                                    debug!("Sent request header: {:?}", req_header);
+                                    debug!("Sent request success: {:?}", req);
                                     // Set to packet task
                                     self.get_packet_task_mut().add_task(req.clone()).await;
                                 } else {
-                                    debug!("Failed to send request header: {:?}", req.seq());
+                                    debug!("Failed to send request: {:?}", req);
                                     break;
                                 }
-
-                                debug!("Sent request: {:?}", req_buffer);
-
                             } else {
                                 debug!("Failed to serialize request: {:?}", req.seq());
                                 break;
@@ -174,15 +190,12 @@ where P: Packet + Clone + Send + Sync + 'static
             match resp_header {
                 Ok(header) => {
                     let header_seq = header.seq;
+                    debug!("Received keep alive response or other response.");
+                    self.received_keepalive_seq.store(header_seq, std::sync::atomic::Ordering::Relaxed);
+                    // Update the received keep alive seq
                     if let Ok(resp_type) = RespType::from_u8(header.op) {
                         match resp_type {
                             RespType::KeepAliveResponse => {
-                                debug!("Received keep alive response.");
-
-                                // Try to get and check the packet
-                                let packet_task = self.get_packet_task_mut();
-                                let _ = packet_task.get_task(header_seq);
-
                                 continue;
                             }
                             _ => {
@@ -205,11 +218,12 @@ where P: Packet + Clone + Send + Sync + 'static
                                 let packet_task: &mut PacketTask<P> = self.get_packet_task_mut();
                                 if let Some(body) = packet_task.get_task(header_seq).await {
                                     // Try to fill the packet with the response
+                                    debug!("Find response body in current client: {:?}", body.seq());
                                     body.deserialize(resp_buffer.as_slice()).unwrap();
                                     if let Ok(_) = response_channel_tx.send(body.clone()).await {
-                                        debug!("Sent response body");
+                                        debug!("Try to send response body to client channel: {:?}", body.seq());
                                     } else {
-                                        debug!("Failed to send response body");
+                                        debug!("Failed to send response body to client channel: {:?}", body.seq());
                                         break;
                                     }
                                 } else {
@@ -285,8 +299,8 @@ impl<P> RpcClient<P>
             .await
             .expect("Failed to connect to the server");
         // TODO: use bounded channel
-        let (request_channel_tx, mut request_channel_rx) = mpsc::channel::<P>(1000);
-        let (response_channel_tx, response_channel_rx) = mpsc::channel::<P>(1000);
+        let (request_channel_tx, mut request_channel_rx) = mpsc::channel::<P>(10000);
+        let (response_channel_tx, response_channel_rx) = mpsc::channel::<P>(10000);
         let inner_connection = Arc::new(RpcClientConnectionInner::new(
             stream,
             timeout_options.clone(),

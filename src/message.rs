@@ -1,4 +1,56 @@
-use crate::{error::RpcError, packet::{Decode, Encode}};
+use crate::{error::RpcError, packet::{Decode, Encode, Packet}};
+
+/// Impl the keep alive request for Packet trait
+#[derive(Debug, Clone)]
+pub struct KeepAlivePacket {
+    /// The sequence number of the request.
+    pub seq: u64,
+    /// The operation type of the request.
+    pub op: u8,
+    /// The status of the request.
+    pub status: u8,
+}
+
+impl KeepAlivePacket {
+    /// Create a new keep alive packet.
+    pub fn new() -> Self {
+        Self { seq: 0, op: 0, status: 0 }
+    }
+}
+
+impl Packet for KeepAlivePacket {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn set_seq(&mut self, seq: u64) {
+        self.seq = seq;
+    }
+
+    fn op(&self) -> u8 {
+        self.op
+    }
+
+    fn set_op(&mut self, op: u8) {
+        self.op = op;
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>, RpcError<String>> {
+        Ok(vec![0u8; 0])
+    }
+
+    fn deserialize(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
+        Ok(())
+    }
+
+    fn status(&self) -> u8 {
+        self.status
+    }
+
+    fn set_status(&mut self, status: u8) {
+        self.status = status;
+    }
+}
 
 /// The request type of the request.
 #[derive(Debug)]

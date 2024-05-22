@@ -199,7 +199,6 @@ where
     pub async fn recv_header(&self) -> Result<ReqHeader, RpcError<String>> {
         let req_header_buffer = self.recv_len(REQ_HEADER_SIZE).await?;
         let req_header = ReqHeader::decode(&req_header_buffer)?;
-        debug!("Received request header: {:?}", req_header);
 
         Ok(req_header)
     }
@@ -221,7 +220,7 @@ where
                     return Ok(req_buffer);
                 }
                 Err(err) => {
-                    debug!("Failed to receive request header: {:?}", err);
+                    debug!("Failed to receive request: {:?}", err);
                     return Err(RpcError::InternalError(err.to_string()));
                 }
             },
@@ -298,12 +297,12 @@ where
         let seq = req_header.seq;
         let body_len = req_header.len;
         if let Ok(req_type) = ReqType::from_u8(req_header.op) {
+            debug!("Dispatch request with header type: {:?}, seq: {:?}, body_len: {:?}", req_type, seq, body_len);
             match req_type {
                 ReqType::KeepAliveRequest => {
                     // Keep-alive request
                     // Directly send keepalive response to client, do not need to submit to worker pool.
                     let _ = KeepAliveHandler::new();
-
                     // In current implementation, we just send keepalive header to the client stream
                     let resp_header = RespHeader {
                         seq,
@@ -326,7 +325,7 @@ where
                             return;
                         }
                     };
-                    debug!("Inner request type: {:?}", req_header.op);
+                    debug!("Dispatched handler for the connection, seq: {:?}", req_header.seq);
                     self.inner
                         .dispatch_handler
                         .dispatch(req_header, req_buffer, done_tx)
@@ -350,20 +349,20 @@ where
         // Worker pool will handle the response sending
         let inner_conn = self.inner.clone();
         tokio::spawn(async move {
-            // TODO: Recv response from the worker pool and send to the stream
-            debug!("RpcServerConnection::run worker pool");
+            debug!("Start to send response to the stream from client");
             loop {
                 match done_rx.recv().await {
                     Some(resp_buffer) => {
+                        debug!("Recv buffer from done_tx channel, try to send response to the stream");
                         // Send response to the stream
                         if let Ok(res) = inner_conn.send_response(&resp_buffer).await {
-                            info!("Sent file block response: {:?}", res);
+                            debug!("Sent file block response: {:?}", res);
                         } else {
-                            info!("Failed to send file block response");
+                            error!("Failed to send file block response");
                         }
                     }
                     None => {
-                        info!("done_rx channel is closed");
+                        info!("done_rx channel is closed, stop sending response to the stream");
                         break;
                     }
                 }
