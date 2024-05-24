@@ -89,8 +89,8 @@ pub enum RespType {
 impl RespType {
     pub fn from_u8(op: u8) -> Result<Self, RpcError<String>> {
         match op {
-            0 => Ok(Self::FileBlockResponse),
-            1 => Ok(Self::KeepAliveResponse),
+            0 => Ok(Self::KeepAliveResponse),
+            1 => Ok(Self::FileBlockResponse),
             _ => Err(RpcError::InternalError(format!(
                 "Invalid operation type: {}",
                 op
@@ -100,8 +100,8 @@ impl RespType {
 
     pub fn to_u8(&self) -> u8 {
         match self {
-            Self::FileBlockResponse => 0,
-            Self::KeepAliveResponse => 1,
+            Self::KeepAliveResponse => 0,
+            Self::FileBlockResponse => 1,
         }
     }
 }

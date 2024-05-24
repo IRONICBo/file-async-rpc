@@ -160,9 +160,9 @@ impl PacketStatus {
 }
 
 
-/// The PacketTask struct is used to store the current and previous tasks.
+/// The PacketsKeeper struct is used to store the current and previous tasks.
 /// It will be modified by single task, so we don't need to share it.
-pub struct PacketTask<P>
+pub struct PacketsKeeper<P>
     where P: Packet + Send + Sync
 {
     /// current tasks, marked by the seq number
@@ -174,10 +174,10 @@ pub struct PacketTask<P>
     timeout: u64,
 }
 
-impl<P: Packet + Send + Sync> PacketTask<P> {
-    /// Create a new PacketTask
+impl<P: Packet + Send + Sync> PacketsKeeper<P> {
+    /// Create a new PacketsKeeper
     pub fn new(timeout: u64) -> Self {
-        PacketTask {
+        PacketsKeeper {
             packets: HashMap::new(),
             timestamp: HashMap::new(),
             timeout,

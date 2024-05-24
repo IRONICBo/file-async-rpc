@@ -369,6 +369,7 @@ where
             }
         });
 
+        let start_time = std::time::Instant::now();
         loop {
             // Receive the request header
             let req_header = match self.inner.recv_header().await {
@@ -382,6 +383,10 @@ where
                 }
             };
 
+            if req_header.seq == 1000 {
+                let end_time = std::time::Instant::now();
+                info!("Total time: {:?}", end_time - start_time);
+            }
             // Dispatch the handler for the connection
             self.dispatch(req_header, done_tx.clone()).await;
         }

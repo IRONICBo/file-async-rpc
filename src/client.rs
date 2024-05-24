@@ -6,14 +6,13 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net,
-    sync::mpsc,
     time::timeout,
 };
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     common::TimeoutOptions, error::RpcError, message::{KeepAlivePacket, ReqType, RespType}, packet::{
-        Decode, Encode, Packet, PacketTask, ReqHeader, RespHeader, REQ_HEADER_SIZE
+        Decode, Encode, Packet, PacketsKeeper, ReqHeader, RespHeader, REQ_HEADER_SIZE
     }
 };
 
@@ -32,7 +31,7 @@ struct RpcClientConnectionInner<T>
     /// If we receive other response, we will update the received_keepalive_seq too, just treat it as a keep alive response.
     received_keepalive_seq: AtomicU64,
     /// send packet task
-    packet_task: UnsafeCell<PacketTask<T>>
+    packet_task: UnsafeCell<PacketsKeeper<T>>
 }
 
 impl<P> RpcClientConnectionInner<P>
@@ -44,7 +43,7 @@ where P: Packet + Clone + Send + Sync + 'static
             timeout_options: timeout_options.clone(),
             seq: AtomicU64::new(0),
             received_keepalive_seq: AtomicU64::new(0),
-            packet_task: UnsafeCell::new(PacketTask::new(timeout_options.clone().idle_timeout.as_secs())),
+            packet_task: UnsafeCell::new(PacketsKeeper::new(timeout_options.clone().idle_timeout.as_secs())),
         }
     }
 
@@ -52,7 +51,7 @@ where P: Packet + Clone + Send + Sync + 'static
     pub async fn recv_header(&self) -> Result<RespHeader, RpcError<String>> {
         let req_header_buffer = self.recv_len(REQ_HEADER_SIZE).await?;
         let req_header = RespHeader::decode(&req_header_buffer)?;
-        debug!("Received request header: {:?}", req_header);
+        debug!("Received response header: {:?}", req_header);
 
         Ok(req_header)
     }
@@ -69,18 +68,18 @@ where P: Packet + Clone + Send + Sync + 'static
         {
             Ok(result) => match result {
                 Ok(result_size) => {
-                    debug!("Received request body len: {:?}", result_size);
+                    debug!("Received response body len: {:?}", result_size);
                     return Ok(req_buffer);
                 }
                 Err(err) => {
-                    debug!("Failed to receive request header: {:?}", err);
+                    debug!("Failed to receive response header: {:?}", err);
                     return Err(RpcError::InternalError(err.to_string()));
                 }
             },
             Err(_) => {
-                debug!("Timeout to receive request header");
+                debug!("Timeout to receive response header");
                 return Err(RpcError::InternalError(
-                    "Timeout to receive request header".to_string(),
+                    "Timeout to receive response header".to_string(),
                 ));
             }
         }
@@ -113,7 +112,7 @@ where P: Packet + Clone + Send + Sync + 'static
     }
 
     /// Send loop for the client.
-    pub async fn send_loop(&self, request_channel_rx: &mut mpsc::Receiver<P>) {
+    pub async fn send_loop(&self, request_channel_rx: &mut flume::Receiver<P>) {
         // Tickers to keep alive the connection
         let mut tickers = tokio::time::interval(self.timeout_options.idle_timeout / 3);
         loop {
@@ -141,9 +140,9 @@ where P: Packet + Clone + Send + Sync + 'static
                         debug!("Failed to send keep alive message");
                     }
                 }
-                req_result = request_channel_rx.recv() => {
+                req_result = request_channel_rx.recv_async() => {
                     match req_result {
-                        Some(mut req) => {
+                        Ok(mut req) => {
                             let current_seq = self.next_seq();
                             req.set_seq(current_seq);
                             debug!("Try to send request: {:?}", req);
@@ -171,9 +170,9 @@ where P: Packet + Clone + Send + Sync + 'static
                                 break;
                             }
                         }
-                        None => {
+                        Err(err) => {
                             // The request channel is closed and no remaining requests
-                            debug!("Request channel closed.");
+                            error!("Failed to receive request: {:?}", err);
                             break;
                         }
                     }
@@ -183,7 +182,7 @@ where P: Packet + Clone + Send + Sync + 'static
     }
 
     /// Receive loop for the client.
-    pub async fn recv_loop(&self, response_channel_tx: mpsc::Sender<P>) {
+    pub async fn recv_loop(&self, response_channel_tx: flume::Sender<P>) {
         loop {
             debug!("Waiting for response...");
             let resp_header = self.recv_header().await;
@@ -215,12 +214,12 @@ where P: Packet + Clone + Send + Sync + 'static
                                 // header buffer with body buffer
 
                                 // Take the packet task and recv the response
-                                let packet_task: &mut PacketTask<P> = self.get_packet_task_mut();
+                                let packet_task: &mut PacketsKeeper<P> = self.get_packet_task_mut();
                                 if let Some(body) = packet_task.get_task(header_seq).await {
                                     // Try to fill the packet with the response
                                     debug!("Find response body in current client: {:?}", body.seq());
                                     body.deserialize(resp_buffer.as_slice()).unwrap();
-                                    if let Ok(_) = response_channel_tx.send(body.clone()).await {
+                                    if let Ok(_) = response_channel_tx.send_async(body.clone()).await {
                                         debug!("Try to send response body to client channel: {:?}", body.seq());
                                     } else {
                                         debug!("Failed to send response body to client channel: {:?}", body.seq());
@@ -260,14 +259,14 @@ where P: Packet + Clone + Send + Sync + 'static
 
     /// Get packet task with mutable reference
     #[inline(always)]
-    fn get_packet_task_mut(&self) -> &mut PacketTask<P> {
+    fn get_packet_task_mut(&self) -> &mut PacketsKeeper<P> {
         // Current implementation is safe because the packet task is only accessed by one thread
         unsafe { std::mem::transmute(self.packet_task.get()) }
     }
 
     /// Get packet task with immutable reference
     #[inline(always)]
-    fn get_packet_task(&self) -> &PacketTask<P> {
+    fn get_packet_task(&self) -> &PacketsKeeper<P> {
         unsafe { std::mem::transmute(self.packet_task.get()) }
     }
 }
@@ -285,9 +284,9 @@ pub struct RpcClient<P>
 where P: Packet + Clone + Send + Sync + 'static,
 {
     /// Request channel for buffer
-    request_channel_tx: mpsc::Sender<P>,
+    request_channel_tx: flume::Sender<P>,
     /// Response channel for buffer
-    response_channel_rx: RefCell<mpsc::Receiver<P>>,
+    response_channel_rx: RefCell<flume::Receiver<P>>,
 }
 
 impl<P> RpcClient<P>
@@ -299,8 +298,8 @@ impl<P> RpcClient<P>
             .await
             .expect("Failed to connect to the server");
         // TODO: use bounded channel
-        let (request_channel_tx, mut request_channel_rx) = mpsc::channel::<P>(10000);
-        let (response_channel_tx, response_channel_rx) = mpsc::channel::<P>(10000);
+        let (request_channel_tx, mut request_channel_rx) = flume::bounded::<P>(10000);
+        let (response_channel_tx, response_channel_rx) = flume::bounded::<P>(10000);
         let inner_connection = Arc::new(RpcClientConnectionInner::new(
             stream,
             timeout_options.clone(),
@@ -331,7 +330,7 @@ impl<P> RpcClient<P>
     /// Contains the request header and body.
     pub async fn send_request(&self, req: P) -> Result<(), RpcError<String>> {
         self.request_channel_tx
-            .send(req)
+            .send_async(req)
             .await
             .map_err(|e| RpcError::InternalError(e.to_string()))
     }
@@ -339,12 +338,10 @@ impl<P> RpcClient<P>
     /// Receive a response from the server.
     pub async fn recv_response(&self) -> Result<P, RpcError<String>> {
         self.response_channel_rx
-            .borrow_mut()
-            .recv()
+            .borrow()
+            .recv_async()
             .await
-            .ok_or(RpcError::InternalError(
-                "Failed to receive response".to_string(),
-            ))
+            .map_err(|e| RpcError::InternalError(e.to_string()))
     }
 }
 
