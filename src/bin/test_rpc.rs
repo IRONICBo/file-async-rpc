@@ -7,7 +7,7 @@ use tracing::{debug, error, info};
 
 // 4MB
 const MAX_PACKET_SIZE: usize = 4 * 1024 * 1024;
-const MAX_PACKET_NUM: usize = 10000;
+const MAX_PACKET_NUM: usize = 1000;
 
 /// Check if the port is in use
 async fn is_port_in_use(addr: &str) -> bool {
@@ -56,10 +56,10 @@ impl Packet for TestPacket {
         // Try to serialize the request packet to a byte array
 
         // Return a 4MB vec
-        // Ok(vec![0u8; MAX_PACKET_SIZE])
+        Ok(vec![0u8; MAX_PACKET_SIZE])
 
-        let v = Vec::with_capacity(MAX_PACKET_SIZE);
-        Ok(v)
+        // let v = Vec::with_capacity(MAX_PACKET_SIZE);
+        // Ok(v)
     }
 
     fn deserialize(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
@@ -168,7 +168,7 @@ async fn main() {
     // Set the tracing log level to debug
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .finish(),
     )
     .expect("Failed to set tracing subscriber");
