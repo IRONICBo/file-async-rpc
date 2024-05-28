@@ -1,4 +1,4 @@
-use crate::{error::RpcError, packet::{Decode, Encode, Packet}};
+use crate::{error::RpcError, packet::{Decode, Encode, Packet, PacketStatus}};
 
 /// Impl the keep alive request for Packet trait
 #[derive(Debug, Clone)]
@@ -8,13 +8,13 @@ pub struct KeepAlivePacket {
     /// The operation type of the request.
     pub op: u8,
     /// The status of the request.
-    pub status: u8,
+    pub status: PacketStatus,
 }
 
 impl KeepAlivePacket {
     /// Create a new keep alive packet.
     pub fn new() -> Self {
-        Self { seq: 0, op: 0, status: 0 }
+        Self { seq: 0, op: 0, status: PacketStatus::Pending }
     }
 }
 
@@ -35,19 +35,27 @@ impl Packet for KeepAlivePacket {
         self.op = op;
     }
 
-    fn serialize(&self) -> Result<Vec<u8>, RpcError<String>> {
-        Ok(vec![0u8; 0])
-    }
-
-    fn deserialize(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
+    fn set_req_data(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
         Ok(())
     }
 
-    fn status(&self) -> u8 {
+    fn get_req_data(&self) -> Result<Vec<u8>, RpcError<String>> {
+        Ok(Vec::new())
+    }
+
+    fn set_resp_data(&mut self, _data: &[u8]) -> Result<(), RpcError<String>> {
+        Ok(())
+    }
+
+    fn get_resp_data(&self) -> Result<Vec<u8>, RpcError<String>> {
+        Ok(Vec::new())
+    }
+
+    fn status(&self) -> PacketStatus {
         self.status
     }
 
-    fn set_status(&mut self, status: u8) {
+    fn set_status(&mut self, status: PacketStatus) {
         self.status = status;
     }
 }

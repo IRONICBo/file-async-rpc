@@ -1,9 +1,9 @@
 use std::{
-    cell::UnsafeCell,
-    sync::Arc,
+    cell::UnsafeCell, mem::transmute, sync::Arc
 };
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt}, net, sync::mpsc, task, time::timeout
 };
@@ -12,7 +12,7 @@ use crate::{
     common::TimeoutOptions, error::RpcError, message::{
         decode_file_block_request, FileBlockRequest,
         FileBlockResponse, ReqType, RespType, StatusCode,
-    }, packet::{Decode, Encode, ReqHeader, RespHeader, REQ_HEADER_SIZE}, workerpool::{Job, WorkerPool}
+    }, packet::{Decode, Encode, ReqHeader, RespHeader, REQ_HEADER_SIZE}, read_exact_timeout, workerpool::{Job, WorkerPool}, write_all_timeout
 };
 
 use tracing::{debug, error, info};
@@ -84,7 +84,7 @@ pub trait RpcServerConnectionHandler {
     async fn dispatch(
         &self,
         req_header: ReqHeader,
-        req_buffer: Vec<u8>,
+        req_buffer: &[u8],
         done_tx: mpsc::Sender<Vec<u8>>,
     );
 }
@@ -106,7 +106,7 @@ impl RpcServerConnectionHandler for FileBlockRpcServerHandler {
     async fn dispatch(
         &self,
         req_header: ReqHeader,
-        req_buffer: Vec<u8>,
+        req_buffer: &[u8],
         done_tx: mpsc::Sender<Vec<u8>>,
     ) {
         // Dispatch the handler for the connection
@@ -163,6 +163,11 @@ where
     timeout_options: TimeoutOptions,
     /// The handler for the connection
     dispatch_handler: T,
+    /// Response buffer, try to reuse same buffer to reduce memory allocation
+    /// In case of the response is too large, we need to consider the buffer size
+    /// Init size is 4MB
+    /// Besides, we want to reduce memory copy, and read/write the response to the same data buffer
+    req_buf: UnsafeCell<BytesMut>,
 }
 
 /// Current implementation is safe because the stream is only accessed by one thread
@@ -192,43 +197,46 @@ where
             worker_pool,
             timeout_options,
             dispatch_handler,
+            req_buf: UnsafeCell::new(BytesMut::with_capacity(8 * 1024 * 1024)),
         }
     }
 
     /// Recv request header from the stream
     pub async fn recv_header(&self) -> Result<ReqHeader, RpcError<String>> {
-        let req_header_buffer = self.recv_len(REQ_HEADER_SIZE).await?;
-        let req_header = ReqHeader::decode(&req_header_buffer)?;
+        // Try to read to buffer
+        match self.recv_len(REQ_HEADER_SIZE).await {
+            Ok(_) => {}
+            Err(err) => {
+                debug!("Failed to receive request header: {:?}", err);
+                return Err(err);
+            }
+        }
+
+        let buffer: &mut BytesMut = unsafe {
+            transmute(self.req_buf.get())
+        };
+        let req_header = ReqHeader::decode(&buffer)?;
+        debug!("Received request header: {:?}", req_header);
 
         Ok(req_header)
     }
 
     /// Recv request body from the stream
-    pub async fn recv_len(&self, len: u64) -> Result<Vec<u8>, RpcError<String>> {
-        let mut req_buffer = vec![0u8; len as usize];
-        // TODO: fix the reference issue
+    pub async fn recv_len(&self, len: u64) -> Result<(), RpcError<String>> {
+        let mut req_buffer: &mut BytesMut = unsafe {
+            transmute(self.req_buf.get())
+        };
+        req_buffer.resize(len as usize, 0);
         let reader = self.get_stream_mut();
-        match timeout(
-            self.timeout_options.read_timeout,
-            reader.read_exact(&mut req_buffer),
-        )
-        .await
+        match read_exact_timeout!(reader, &mut req_buffer, self.timeout_options.read_timeout).await
         {
-            Ok(result) => match result {
-                Ok(result_size) => {
-                    debug!("Received request body: {:?}", result_size);
-                    return Ok(req_buffer);
-                }
-                Err(err) => {
-                    debug!("Failed to receive request: {:?}", err);
-                    return Err(RpcError::InternalError(err.to_string()));
-                }
-            },
-            Err(_) => {
-                debug!("Timeout to receive request header");
-                return Err(RpcError::InternalError(
-                    "Timeout to receive request header".to_string(),
-                ));
+            Ok(size) => {
+                debug!("Received request body: {:?}", size);
+                return Ok(());
+            }
+            Err(err) => {
+                debug!("Failed to receive request: {:?}", err);
+                return Err(RpcError::InternalError(err.to_string()));
             }
         }
     }
@@ -237,22 +245,14 @@ where
     /// The response is a byte array, contains the response header and body.
     pub async fn send_response(&self, resp: &[u8]) -> Result<(), RpcError<String>> {
         let writer = self.get_stream_mut();
-        match timeout(self.timeout_options.write_timeout, writer.write_all(resp)).await {
-            Ok(result) => match result {
-                Ok(_) => {
-                    debug!("Sent response: {:?}", resp);
-                    return Ok(());
-                }
-                Err(err) => {
-                    debug!("Failed to send response: {:?}", err);
-                    return Err(RpcError::InternalError(err.to_string()));
-                }
-            },
-            Err(_) => {
-                debug!("Timeout to send response");
-                return Err(RpcError::InternalError(
-                    "Timeout to send response".to_string(),
-                ));
+        match write_all_timeout!(writer, resp, self.timeout_options.write_timeout).await {
+            Ok(_) => {
+                debug!("Sent response: {:?}", resp.len());
+                return Ok(());
+            }
+            Err(err) => {
+                debug!("Failed to send response: {:?}", err);
+                return Err(RpcError::InternalError(err.to_string()));
             }
         }
     }
@@ -318,14 +318,17 @@ where
                 }
                 _ => {
                     // Try to read the request body
-                    let req_buffer = match self.inner.recv_len(body_len).await {
-                        Ok(buffer) => buffer,
+                    match self.inner.recv_len(body_len).await {
+                        Ok(_) => {},
                         Err(err) => {
                             error!("Failed to receive request body: {:?}", err);
                             return;
                         }
                     };
                     debug!("Dispatched handler for the connection, seq: {:?}", req_header.seq);
+                    let req_buffer: &mut BytesMut = unsafe {
+                        transmute(self.inner.req_buf.get())
+                    };
                     self.inner
                         .dispatch_handler
                         .dispatch(req_header, req_buffer, done_tx)
@@ -343,7 +346,7 @@ where
         debug!("RpcServerConnection::run");
 
         // TODO: copy done_tx to the worker pool
-        let (done_tx, mut done_rx) = mpsc::channel::<Vec<u8>>(1000);
+        let (done_tx, mut done_rx) = mpsc::channel::<Vec<u8>>(10000);
 
         // Send response to the stream from the worker pool
         // Worker pool will handle the response sending

@@ -7,7 +7,7 @@ use tracing::{debug, error, info};
 
 // 4MB
 const MAX_PACKET_SIZE: usize = 4 * 1024 * 1024;
-const MAX_PACKET_NUM: usize = 1000;
+const MAX_PACKET_NUM: usize = 5000;
 
 /// Check if the port is in use
 async fn is_port_in_use(addr: &str) -> bool {
@@ -168,7 +168,7 @@ async fn main() {
     // Set the tracing log level to debug
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .finish(),
     )
     .expect("Failed to set tracing subscriber");
@@ -239,5 +239,6 @@ async fn main() {
     // Wait for the server to start
     // tokio::time::sleep(Duration::from_secs(2)).await;
 
+    drop(rpc_client);
     server.stop().await;
 }

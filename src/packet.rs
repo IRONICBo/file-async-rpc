@@ -9,12 +9,14 @@ pub const REQ_HEADER_SIZE: u64 = 17;
 /// The size of the response header.
 pub const RESP_HEADER_SIZE: u64 = 17;
 
-/// The Encode trait is used to encode a data structure into a byte buffer.
+
+
+/// The Encode trait is used to encode a message structure into a byte buffer.
 pub trait Encode {
     fn encode(&self) -> Vec<u8>;
 }
 
-/// The Decode trait is used to decode a byte buffer into a data structure.
+/// The Decode trait is used to message a byte buffer into a data structure.
 pub trait Decode {
     fn decode(buf: &[u8]) -> Result<Self, RpcError<String>>
     where
@@ -118,19 +120,26 @@ pub trait Packet: Sync + Send + Clone + Debug {
     /// Set packet type
     fn set_op(&mut self, op: u8);
 
-    /// Serialize self packet to a byte array
-    fn serialize(&self) -> Result<Vec<u8>, RpcError<String>>;
-    /// Deserialize the packet from a byte array
-    /// As the client, client will receive the response, and fill current Packet struct
-    fn deserialize(&mut self, data: &[u8]) -> Result<(), RpcError<String>>;
+    /// Serialize request data to bytes
+    fn set_req_data(&mut self, data: &[u8]) -> Result<(), RpcError<String>>;
+
+    /// Get the serialized request data
+    fn get_req_data(&self) -> Result<Vec<u8>, RpcError<String>>;
+
+    /// Serialize response data to bytes
+    fn set_resp_data(&mut self, data: &[u8]) -> Result<(), RpcError<String>>;
+
+    /// Deserialize response data from bytes
+    fn get_resp_data(&self) -> Result<Vec<u8>, RpcError<String>>;
 
     /// Get the packet status
-    fn status(&self) -> u8;
+    fn status(&self) -> PacketStatus;
+
     /// Set the packet status
-    fn set_status(&mut self, status: u8);
+    fn set_status(&mut self, status: PacketStatus);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PacketStatus {
     Pending,
     Success,
@@ -167,6 +176,13 @@ pub struct PacketsKeeper<P>
 {
     /// current tasks, marked by the seq number
     packets: HashMap<u64, P>,
+    /// Delay to kepp the task from the previous_tasks
+    /// Each vec item is in one second, if the task is timeout, we will remove it from the previous_tasks
+    /// If the task is full, we will remove the task from the previous_tasks and set timeout
+    /// Typically, the delay task id is growing, so we will use the VecDeque to store the tasks
+    // delay_tasks: VecDeque<HashMap<u64, P>>,
+    /// Search by the start seq number and reduce search time
+    // delay_start: VecDeque<u64>,
     /// timestamp of seq number, marked by the seq number
     timestamp: HashMap<u64, u64>,
     /// The maximum number of tasks that can be stored in the previous_tasks
@@ -177,11 +193,13 @@ pub struct PacketsKeeper<P>
 impl<P: Packet + Send + Sync> PacketsKeeper<P> {
     /// Create a new PacketsKeeper
     pub fn new(timeout: u64) -> Self {
-        PacketsKeeper {
+        let keeper = PacketsKeeper {
             packets: HashMap::new(),
             timestamp: HashMap::new(),
             timeout,
-        }
+        };
+
+        keeper
     }
 
     /// Add a task to the packets
@@ -189,14 +207,48 @@ impl<P: Packet + Send + Sync> PacketsKeeper<P> {
         let seq = packet.seq();
         self.packets.insert(seq, packet);
         // Get current timestamp
+        // TODO: use a global atomic ticker(updated by check_loop) or read current time?
         let timestamp = tokio::time::Instant::now().elapsed().as_secs();
         self.timestamp.insert(seq, timestamp);
     }
 
+    /// Clean pending tasks as timeout
+    pub async fn clean_timeout_tasks(&mut self) {
+        let mut timeout_packets = Vec::new();
+        for (seq, packet) in self.packets.iter_mut() {
+            match packet.status() {
+                PacketStatus::Pending => {
+                    // Check if the task is timeout
+                    if let Some(timestamp) = self.timestamp.get(seq) {
+                        let current_timestamp = tokio::time::Instant::now().elapsed().as_secs();
+                        if current_timestamp - timestamp > self.timeout {
+                            // Set the task as timeout
+                            debug!("Task {} is timeout", seq);
+                            packet.set_status(PacketStatus::Timeout);
+                            timeout_packets.push(*seq);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Remove the timeout packets
+        for seq in timeout_packets {
+            self.packets.remove(&seq);
+            self.timestamp.remove(&seq);
+        }
+    }
+
     /// Get a task from the packets
-    pub async fn get_task(&mut self, seq: u64) -> Option<&mut P> {
+    pub async fn get_task(&self, seq: u64) -> Option<&P> {
+        self.packets.get(&seq)
+    }
+
+    /// Get a task from the packets
+    pub async fn get_task_mut(&mut self, seq: u64) -> Option<&mut P> {
         if let Some(packet) = self.packets.get_mut(&seq) {
-            match PacketStatus::from_u8(packet.status()) {
+            match packet.status() {
                 // TODO: Only used for check status, we will not modify the status here
                 PacketStatus::Success => {
                     return Some(packet);
@@ -214,7 +266,7 @@ impl<P: Packet + Send + Sync> PacketsKeeper<P> {
                         if current_timestamp - timestamp > self.timeout {
                             // Set the task as timeout
                             debug!("Task {} is timeout", seq);
-                            packet.set_status(PacketStatus::Timeout.to_u8());
+                            packet.set_status(PacketStatus::Timeout);
                             return None;
                         }
 
