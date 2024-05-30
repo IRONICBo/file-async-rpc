@@ -188,6 +188,7 @@ pub struct PacketsKeeper<P>
     /// The maximum number of tasks that can be stored in the previous_tasks
     /// We will mark the task as timeout if it is in the previous_tasks and the previous_tasks is full
     timeout: u64,
+    // TODO: add init timeout here, to avoid the systemcall
 }
 
 impl<P: Packet + Send + Sync> PacketsKeeper<P> {
@@ -215,12 +216,12 @@ impl<P: Packet + Send + Sync> PacketsKeeper<P> {
     /// Clean pending tasks as timeout
     pub async fn clean_timeout_tasks(&mut self) {
         let mut timeout_packets = Vec::new();
+        let current_timestamp = tokio::time::Instant::now().elapsed().as_secs();
         for (seq, packet) in self.packets.iter_mut() {
             match packet.status() {
                 PacketStatus::Pending => {
                     // Check if the task is timeout
                     if let Some(timestamp) = self.timestamp.get(seq) {
-                        let current_timestamp = tokio::time::Instant::now().elapsed().as_secs();
                         if current_timestamp - timestamp > self.timeout {
                             // Set the task as timeout
                             debug!("Task {} is timeout", seq);
@@ -240,23 +241,22 @@ impl<P: Packet + Send + Sync> PacketsKeeper<P> {
         }
     }
 
-    /// Get a task from the packets
-    pub async fn get_task(&self, seq: u64) -> Option<&P> {
-        self.packets.get(&seq)
+    /// Get a task from the packets and remove it
+    pub async fn consume_task(&mut self, seq: u64) -> Option<P> {
+        if let Some(packet) = self.packets.remove(&seq) {
+            self.timestamp.remove(&seq);
+            return Some(packet);
+        }
+
+        None
     }
 
     /// Get a task from the packets
-    pub async fn get_task_mut(&mut self, seq: u64) -> Option<&mut P> {
+    pub async fn take_task_mut(&mut self, seq: u64) -> Option<&mut P> {
         if let Some(packet) = self.packets.get_mut(&seq) {
             match packet.status() {
                 // TODO: Only used for check status, we will not modify the status here
-                PacketStatus::Success => {
-                    return Some(packet);
-                }
-                PacketStatus::Failed => {
-                    return Some(packet);
-                }
-                PacketStatus::Timeout => {
+                PacketStatus::Success | PacketStatus::Failed | PacketStatus::Timeout => {
                     return Some(packet);
                 }
                 PacketStatus::Pending => {

@@ -114,36 +114,29 @@ where
         self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Keep alive loop for the client stream
-    async fn keep_alive_loop(&self) {
-        let mut tickers = tokio::time::interval(self.timeout_options.idle_timeout / 3);
-        loop {
-            tokio::select! {
-                _ = tickers.tick() => {
-                    // Send keep alive message
-                    let current_seq = self.next_seq();
-                    // Check keepalive is valid
-                    let received_keepalive_seq = self.received_keepalive_seq.load(std::sync::atomic::Ordering::Relaxed);
-                    if current_seq - received_keepalive_seq > 100 {
-                        debug!("Keep alive timeout, close the connection");
-                        break;
-                    }
+    pub async fn ping(&self) -> Result<(), RpcError<String>> {
+        // Send keep alive message
+        let current_seq = self.next_seq();
+        // Check keepalive is valid
+        let received_keepalive_seq = self.received_keepalive_seq.load(std::sync::atomic::Ordering::Relaxed);
+        if current_seq - received_keepalive_seq > 100 {
+            debug!("Keep alive timeout, close the connection");
+            return Err(RpcError::InternalError("Keep alive timeout".to_string()));
+        }
 
-                    // Set to packet task
-                    let keep_alive_msg = ReqHeader {
-                        seq: current_seq,
-                        op: ReqType::KeepAliveRequest.to_u8(),
-                        len: 0,
-                    }.encode();
+        // Set to packet task
+        let keep_alive_msg = ReqHeader {
+            seq: current_seq,
+            op: ReqType::KeepAliveRequest.to_u8(),
+            len: 0,
+        }.encode();
 
-                    if let Ok(_) =  self.send_data(&keep_alive_msg).await {
-                        debug!("Success to sent keep alive message");
-                    } else {
-                        debug!("Failed to send keep alive message");
-                        break;
-                    }
-                }
-            }
+        if let Ok(_) =  self.send_data(&keep_alive_msg).await {
+            debug!("Success to sent keep alive message");
+            Ok(())
+        } else {
+            debug!("Failed to send keep alive message");
+            Err(RpcError::InternalError("Failed to send keep alive message".to_string()))
         }
     }
 
@@ -182,10 +175,10 @@ where
     }
 
     /// Receive packet by the client
-    pub async fn recv_packet(&self, resp_packet: &mut P) -> Option<&P> {
+    pub async fn recv_packet(&self, resp_packet: &mut P) -> Option<P> {
         // Try to receive the response from innner keeper
         let packets_keeper: &mut PacketsKeeper<P> = self.get_packets_keeper_mut();
-        packets_keeper.get_task(resp_packet.seq()).await
+        packets_keeper.consume_task(resp_packet.seq()).await
     }
 
     /// Receive loop for the client.
@@ -230,7 +223,7 @@ where
 
                                 // Take the packet task and recv the response
                                 let packets_keeper: &mut PacketsKeeper<P> = self.get_packets_keeper_mut();
-                                if let Some(body) = packets_keeper.get_task_mut(header_seq).await {
+                                if let Some(body) = packets_keeper.take_task_mut(header_seq).await {
                                     // Try to fill the packet with the response
                                     debug!("Find response body in current client: {:?}", body.seq());
                                     let resp_buffer: &mut BytesMut = unsafe {
@@ -238,8 +231,8 @@ where
                                     };
 
                                     // Update status data
+                                    // Try to set result code in `set_resp_data`
                                     body.set_resp_data(resp_buffer).unwrap();
-                                    body.set_status(PacketStatus::Success);
                                 } else {
                                     debug!("Failed to get packet task");
                                     break;
@@ -325,14 +318,6 @@ impl<P> RpcClient<P>
 
     /// Start client receiver
     pub async fn start_recv(&self) {
-        // Create a keepalive send loop
-        let inner_connection_clone = self.inner_connection.clone();
-        tokio::spawn(async move {
-            inner_connection_clone
-                .keep_alive_loop()
-                .await;
-        });
-
         // Create a receiver loop
         let inner_connection_clone = self.inner_connection.clone();
         tokio::spawn(async move {
@@ -350,9 +335,16 @@ impl<P> RpcClient<P>
     }
 
     /// Get the response from the server.
-    pub async fn recv_response(&self, resp: &mut P) -> Option<&P> {
+    pub async fn recv_response(&self, resp: &mut P) -> Option<P> {
         // Try to receive the response from innner keeper
         self.inner_connection.recv_packet(resp).await
+    }
+
+    /// Manaully send ping by the send request
+    /// The inner can not start two loop, because the stream is unsafe
+    /// we need to start the loop in the client or higher level manaully
+    pub async fn ping(&self) -> Result<(), RpcError<String>> {
+        self.inner_connection.ping().await
     }
 }
 
