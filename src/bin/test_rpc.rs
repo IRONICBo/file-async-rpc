@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use file_async_rpc::{client::RpcClient, common::TimeoutOptions, connect_timeout, error::RpcError, message::ReqType, packet::{Encode, Packet, PacketStatus, ReqHeader, RespHeader}, server::{FileBlockRpcServerHandler, RpcServer, RpcServerConnectionHandler}, workerpool::{Job, WorkerPool}};
+use file_async_rpc::{client::RpcClient, common::ServerTimeoutOptions, common::ClientTimeoutOptions, connect_timeout, error::RpcError, message::ReqType, packet::{Encode, Packet, PacketStatus, ReqHeader, RespHeader}, server::{FileBlockRpcServerHandler, RpcServer, RpcServerConnectionHandler}, workerpool::{Job, WorkerPool}};
 use tokio::{net::TcpStream, sync::mpsc, time::Instant};
 use tonic::async_trait;
 use tracing::{debug, error, info};
@@ -185,15 +185,16 @@ async fn main() {
     )
     .expect("Failed to set tracing subscriber");
 
-    let rpc_server_options = TimeoutOptions {
+    let rpc_server_options = ServerTimeoutOptions {
         read_timeout: Duration::from_secs(10),
         write_timeout: Duration::from_secs(10),
         idle_timeout: Duration::from_secs(10),
     };
-    let rpc_client_options = TimeoutOptions {
+    let rpc_client_options = ClientTimeoutOptions {
         read_timeout: Duration::from_secs(10),
         write_timeout: Duration::from_secs(10),
         idle_timeout: Duration::from_secs(10),
+        keep_alive_timeout: Duration::from_secs(10),
     };
 
     // Create server
